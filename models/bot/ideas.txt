@@ -1,0 +1,2 @@
+Add a bluffing feature to the bot
+Also a feature to ignore all in's and not immediately fold
