@@ -1,6 +1,6 @@
 import sys, os
 sys.path.append(os.path.abspath(".."))
-from models.card.Card import Card
+from models.GameElements.Card import Card
 import random
 
 class Deck():

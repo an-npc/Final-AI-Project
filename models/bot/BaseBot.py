@@ -7,6 +7,7 @@ class BaseBot():
         self.hand = [] # stores type card
         self.chips = 0
         self.current_bet = 0
+        self.is_out = False # is checked by Game to determine skips or plays
 
     def get_hand(self):
         """_note_
@@ -65,17 +66,19 @@ class BaseBot():
     # actions
     def fold(self):
         """_note_
-        forfeit hand and claim to the pot, throws away hand
+        forfeit hand and claim to the pot including what you've already bet
         """
-        pass
+        self.hand = []
+        self.is_out = True
 
-    def check(self):
+
+    def check(self, table_bet):
         """_note_
         pass action to next player without placing bet
         allowed when no one has made a bet yet
         """
+        print("Action has been checked")
 
-        pass
 
     def call(self, table_bet):
         """_note_
@@ -92,23 +95,20 @@ class BaseBot():
         
         return amount
 
-    def bet(self, bet_amount):
-        """_note_
-        make the first wager of the betting round
-        """
-
-        pass
-
-    def raise_bet(self):
+    def raise_bet(self,table_bet,bet_amount):
         """_note_
         increase the size of a bet
         """
+        if (self.chips != 0):
+            self.chips -= bet_amount
+            return bet_amount
+        print('Chips are 0, Cannot Bet')
 
-        pass
-
-    def all_in(self):
+    def all_in(self,table_bet):
         """_note_
         wager all of your remaining chips
         """
+        amount = self.chips
+        self.chips = 0
 
-        pass
+        return amount
