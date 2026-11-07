@@ -140,3 +140,42 @@ for stage in ["preflop", "flop", "turn", "river"]:
         give them the pot and stop
 self.showdown()
 ```
+
+## Connect to the Bot Server
+Connection was successful, but two new methods has to be added to the base bot. 
+Game will be used a server substitute for baseline testing.
+
+### How it works
+The server runs the whole game: it deals, enforces the rules, and manages the pot. After every change it sends each bot a snapshot of the table as JSON. On the bot's turn, the bot replies with an action: `fold`, `check`, `call` or `raise`.
+
+So your own `Game` class isn't used when playing on the server. It's still useful for testing offline.
+
+### What I added
+
+- **[run_bot.py](run_bot.py)** (new): connects to the server, joins the table, and waits for snapshots. On your turn it asks the bot what to do and sends the answer. If the server rejects a move, it falls back to `call` once, as the server's README recommends.
+- **[BaseBot.py](models/bot/BaseBot.py)**, two new methods at the bottom:
+  - `update_from_state(state, my_id)` copies your cards, chips and `current_bet` from the snapshot into the bot. The server's numbers are the real ones, so this runs before every decision.
+  - `choose_action(state)` returns something like `("call", 0)`. The default checks when nothing is owed and calls otherwise. **This is where your strategy goes.** Write a child class that overrides it.
+
+### Running it
+
+1. Start the server (first terminal):
+   ```
+   cd ai-poker-server-master
+   ..\.venv\Scripts\python -m uvicorn app.server:app --port 8000
+   ```
+2. Start your bot (second terminal, from the project folder):
+   ```
+   .venv\Scripts\python run_bot.py --id group-1 --name "Bot Group 1"
+   ```
+3. Add opponents to practice against: `.venv\Scripts\python ai-poker-server-master\scripts\demo_bots.py --count 2`
+4. Open http://localhost:8000 and press **Start**.
+
+For the real tournament, pass the professor's address with `--url ws://<their-server>:8000/ws`. Keep the same `--id` every time: reconnecting with it gets your seat and chips back.
+
+### Things to know
+
+- **Virtual environment:** I created `.venv` in the project folder and installed the server's requirements into it. Plain `python` doesn't have `websockets` installed, so use `.venv\Scripts\python`. The folder ignores itself in git.
+- **Raise amount:** the server's `raise` amount is your **total** bet for the round, not the extra chips. To raise to 60 when you've already put in 20, send `("raise", 60)`.
+- **Card format:** cards from the server use ranks 2–14 (Ace = 14) and suits S/H/D/C. Your `Deck` uses Ace = 1 and labels spades as `"A"`, so the hand-ranking code in `Game` may need adjusting before your strategy uses it on server cards.
+- **Not committed yet:** `ai-poker-server-master/` and `run_bot.py` are untracked, and the `BaseBot.py` change is uncommitted.

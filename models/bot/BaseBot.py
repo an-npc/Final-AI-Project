@@ -1,3 +1,5 @@
+from models.GameElements.Card import Card
+
 class BaseBot():
     # acts as the parent already passing the mandatory attributes and function of a bot to its children
     def __init__(self):
@@ -112,3 +114,27 @@ class BaseBot():
         self.chips = 0
 
         return amount
+
+    # server
+    def update_from_state(self, state, my_id):
+        """_note_
+        copies this bot's hand, chips, and current_bet from a server state snapshot
+        the server is the source of truth, so this runs before every decision
+        """
+        me = next(p for p in state["players"] if p["id"] == my_id)
+        # server ranks are 2-14 (14 = Ace), suits are full names like "spades"
+        self.hand = [Card(c["rank"], c["suit"][0].upper()) for c in me["hole_cards"]]
+        self.chips = me["stack"]
+        self.current_bet = me["bet"]
+        self.is_out = me["folded"]
+
+    def choose_action(self, state):
+        """_note_
+        decides what to do on this bot's turn, returns action and amount
+        for "raise", amount is the bots total bet for the round, not the extra chips
+        child bots override this with their own strategy, default is check or call
+        """
+        table_bet = max(p["bet"] for p in state["players"])
+        if table_bet == self.current_bet:
+            return "check", 0
+        return "call", 0
