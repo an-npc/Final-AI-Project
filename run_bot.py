@@ -3,6 +3,8 @@ connects a bot to the poker server and plays until stopped with Ctrl+C
 run from the project folder:
     python run_bot.py
     python run_bot.py --id group-1 --name "Bot Group 1" --url ws://localhost:8000/ws
+    python run_bot.py --bot all-in --id baseline-all-in --name "Baseline All-In"
+    python run_bot.py --bot random --id baseline-random --name "Baseline Random"
 """
 import argparse
 import asyncio
@@ -11,6 +13,13 @@ import json
 import websockets
 
 from models.bot.BaseBot import BaseBot
+from models.bot.BaselineBots import AllInBot, RandomBot
+
+BOTS = {
+    "base": BaseBot,
+    "all-in": AllInBot,
+    "random": RandomBot,
+}
 
 
 async def play(bot, my_id, name, url):
@@ -55,9 +64,10 @@ def main():
     parser.add_argument("--id", default="group-1", help="stable player_id, reconnecting with it keeps your seat")
     parser.add_argument("--name", default="Bot Group 1", help="name shown at the table")
     parser.add_argument("--url", default="ws://localhost:8000/ws", help="server websocket address")
+    parser.add_argument("--bot", choices=BOTS, default="base", help="bot strategy to run")
     args = parser.parse_args()
 
-    bot = BaseBot()
+    bot = BOTS[args.bot]()
     try:
         asyncio.run(play(bot, args.id, args.name, args.url))
     except KeyboardInterrupt:

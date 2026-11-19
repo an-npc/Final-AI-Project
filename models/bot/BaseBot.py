@@ -128,7 +128,7 @@ class BaseBot():
         self.current_bet = me["bet"]
         self.is_out = me["folded"]
 
-    def choose_action(self, state):
+    def choose_action(self, state) -> tuple[str, int]:
         """_note_
         decides what to do on this bot's turn, returns action and amount
         for "raise", amount is the bots total bet for the round, not the extra chips
