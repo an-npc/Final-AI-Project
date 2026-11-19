@@ -1,0 +1,10 @@
+# Claude Code [Colton] (personal, not shared with the team)
+*.local.md
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# Equity run output (machine dependent)
+models/equity/equity_results.json
