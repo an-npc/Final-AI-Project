@@ -2,7 +2,7 @@ import sys, os
 from itertools import combinations
 from collections import Counter
 sys.path.append(os.path.abspath(".."))
-from models.GameElements.Card import Card
+from phevaluator import Card
 from models.GameElements.Deck import Deck
 from models.bot.BaseBot import BaseBot
 
@@ -131,9 +131,9 @@ class Game():
         scores exactly 5 cards as (category, tiebreakers...)
         category goes from 0 (high card) to 9 (royal flush)
         """
-        # Aces are stored as 1 but count high, so treat them as 14
-        ranks = sorted((14 if int(card.get_rank()) == 1 else int(card.get_rank()) for card in cards), reverse=True)
-        suits = [card.get_suit() for card in cards]
+        # phevaluator card id = rank * 4 + suit, with rank 0 = deuce .. 12 = ace, so id // 4 + 2 gives 2..14
+        ranks = sorted((card.id_ // 4 + 2 for card in cards), reverse=True)
+        suits = [card.id_ % 4 for card in cards]
 
         is_flush = len(set(suits)) == 1
 

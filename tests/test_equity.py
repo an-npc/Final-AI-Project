@@ -11,7 +11,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) 
 
 import pytest
 from models.equity.equity import equityV1
-from models.GameElements.Card import Card
+from phevaluator import Card
 
 TRIALS = 10000
 TOL = 0.01
@@ -19,8 +19,8 @@ SEED = 1
 
 
 def cards(text):
-    """'AhKs' -> [Card('A','h'), Card('K','s')]. Empty string -> []."""
-    return [Card(text[i], text[i + 1]) for i in range(0, len(text), 2)]
+    """'AhKs' -> [Card('Ah'), Card('Ks')]. Empty string -> []."""
+    return [Card(text[i:i + 2]) for i in range(0, len(text), 2)]
 
 
 # ---------------------------------------------------------------- DeucesCracked exact preflop matchups

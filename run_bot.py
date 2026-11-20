@@ -13,7 +13,7 @@ import json
 import websockets
 
 from models.bot.BaseBot import BaseBot
-from models.bot.BaselineBots import AllInBot, RandomBot
+from models.bot.RandomBot import AllInBot, RandomBot
 
 BOTS = {
     "base": BaseBot,
