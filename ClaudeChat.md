@@ -179,3 +179,51 @@ For the real tournament, pass the professor's address with `--url ws://<their-se
 - **Raise amount:** the server's `raise` amount is your **total** bet for the round, not the extra chips. To raise to 60 when you've already put in 20, send `("raise", 60)`.
 - **Card format:** cards from the server use ranks 2–14 (Ace = 14) and suits S/H/D/C. Your `Deck` uses Ace = 1 and labels spades as `"A"`, so the hand-ranking code in `Game` may need adjusting before your strategy uses it on server cards.
 - **Not committed yet:** `ai-poker-server-master/` and `run_bot.py` are untracked, and the `BaseBot.py` change is uncommitted.
+
+## Equity
+[equity.py](models/equity/equity.py) estimates **equity**, which is the chance your hand wins (or its share of the pot) against opponents. It does this with a **Monte Carlo simulation**. [`simulate`](models/equity/equity.py#L14) deals random opponent hands and the rest of the board, scores everyone with **phevaluator**, and returns a win, loss, or tie share. [`equityV1`](models/equity/equity.py#L59) repeats that many times, up to **10000 simulations**, and averages the results. It also supports a **seed** for reproducibility, known **opponent_hands**, and a **time_budget_ms** cap.
+
+The point is to give your bot a numeric basis for its decisions. The **random and all-in baselines** from your earlier commits ignore hand strength. A smarter bot can compare its equity against the pot odds to decide whether to fold, call, or raise. It also lets you measure any later bot against those baselines.
+
+## PhEvaluator Python Library
+Used to determine how good of a hand the players hand. 
+Scaled from 1 (best) to 7462 (worst)
+
+
+## Update Local Card Object to PhEvaluator's Card
+**Command**: update the equity.py to create a json file named preflop_equity.json. the json will have the structure of { { “hand” : ["4c", "4h”, "4s", , "9c", "9d"], probability” : 0.8 }, { “hand” : ["3c", "3h”, "3s", , "9c", "9d"],probability” : 0.3 }} sort the hand before inserting into the json file by using.
+
+**Claude Response**: Every `from models.GameElements.Card import Card` in the project now imports `from phevaluator import Card`. All **37 tests** in `test_equity.py` pass.
+
+The import swap alone would have broken things, because phevaluator's **Card** takes a single string like `Card("Ah")`, not `Card(rank, suit)`. It also has no `RANKS`, `SUITS`, `get_rank()` or `get_suit()`. So I also updated the code that used those:
+
+- **[Deck.py](models/GameElements/Deck.py):** the rank and suit strings now live in the file itself, and each card is built as `Card(rank + suit)`.
+- **[Game.py](models/GameElements/Game.py#L135-L136):** `score_five` now gets rank as `id_ // 4 + 2` (2 to 14) and suit as `id_ % 4`, using the **card ID** formula from the earlier `to_id` discussion.
+- **[BaseBot.py](models/bot/BaseBot.py#L126):** server cards like `{rank: 14, suit: "spades"}` are converted to `Card("As")`.
+- **[equity.py](models/equity/equity.py) and [test_equity.py](tests/test_equity.py#L21-L23):** both now use `Card("Ah")` and `Card(text[i:i+2])`.
+
+I spot-checked a royal flush, a wheel straight, the 52-card deck and the server-card conversion, and all came out right. To run the tests I installed **pytest** into Python 3.14, since it wasn't there.
+
+Two things are left for you:
+
+- [Card.py](models/GameElements/Card.py) is now unused, but I left it in place. Let me know if I should delete it.
+- Your notebook still has `Card(2,'H')`, which will error with phevaluator's Card. Change it to `Card("2h")`.
+
+
+## Implementing the Lookup Tables for the Poker Stages
+**Command** update the equity.py to create a json file named preflop_equity.json. the json will have the structure of { { “hand” : ["4c", "4h”, "4s", "9c", "9d"], "probability” : 0.8 }, { “hand” : ["3c", "3h”, "3s", "9c", "9d"], "probability” : 0.3 }, ... } sort the hand before inserting into the json file by using Card.to_id() which will return a rank from 0 to 51.
+
+**Claude Response**
+The full run finished, and [preflop_equity.json](models/equity/preflop_equity.json) now has **5,304 entries**: 1,326 hands for each of 1 to 4 **opponents**.
+
+I spot-checked a few hands, and they match published preflop odds to within about 1%. That's the expected **margin** at 10,000 simulations.
+
+| Hand | 1 opp | 2 opp | 3 opp | 4 opp |
+|---|---|---|---|---|
+| AA | 0.857 | 0.732 | 0.630 | 0.558 |
+| AKs | 0.673 | 0.511 | 0.422 | 0.356 |
+| 72o | 0.346 | 0.197 | 0.136 | 0.104 |
+
+Equity drops as **opponents** are added, so the opponents field matters. Against your 4 bots, even AA wins only about 56% of the time.
+
+To look up a hand during live play, sort the bot's two cards with `Card.to_id`, then match `hand` and `opponents`. Loading the file once into a dict keyed by `(card1, card2, opponents)` makes each lookup instant.

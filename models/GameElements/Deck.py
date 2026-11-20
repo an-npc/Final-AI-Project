@@ -1,16 +1,19 @@
 import sys, os
 sys.path.append(os.path.abspath(".."))
-from models.GameElements.Card import Card
+from phevaluator import Card
 import random
+
+RANKS = "23456789TJQKA"
+SUITS = "cdhs"
 
 class Deck():
     def __init__(self):
         self.deck = []
         self.count = 52
-        # AI-generated: replaced the match-based suit loop and Ace=1 ranks with phevaluator-format cards
-        for suit in Card.SUITS:
-            for rank in Card.RANKS:
-                self.deck.append(Card(rank, suit))
+        # AI-generated: builds phevaluator Cards from 2-char strings like "Ah", "Td"
+        for suit in SUITS:
+            for rank in RANKS:
+                self.deck.append(Card(rank + suit))
                 
     def get_count(self):
         return self.count

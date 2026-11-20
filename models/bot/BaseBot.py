@@ -1,4 +1,4 @@
-from models.GameElements.Card import Card
+from phevaluator import Card
 
 class BaseBot():
     # acts as the parent already passing the mandatory attributes and function of a bot to its children
@@ -123,7 +123,7 @@ class BaseBot():
         """
         me = next(p for p in state["players"] if p["id"] == my_id)
         # server ranks are 2-14 (14 = Ace), suits are full names like "spades"
-        self.hand = [Card(c["rank"], c["suit"][0].upper()) for c in me["hole_cards"]]
+        self.hand = [Card("23456789TJQKA"[int(c["rank"]) - 2] + c["suit"][0].lower()) for c in me["hole_cards"]]
         self.chips = me["stack"]
         self.current_bet = me["bet"]
         self.is_out = me["folded"]

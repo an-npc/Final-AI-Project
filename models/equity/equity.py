@@ -4,8 +4,10 @@ import json
 import math
 import random
 import time
-from phevaluator import evaluate_cards  # lower score = better hand (1 = royal flush, 7462 = worst)
-from models.GameElements.Card import Card
+from itertools import combinations
+from phevaluator import evaluate_cards  
+# lower score = better hand (1 = royal flush, 7462 = worst)
+from phevaluator import Card
 from models.GameElements.Deck import Deck
 
 deck = Deck()
@@ -133,9 +135,49 @@ def save_result(hand, table, players, result, seed = None, opponent_hands = None
         json.dump(runs, f, indent=2)
     return record
 
+PREFLOP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preflop_equity.json")
+
+def build_preflop_table(opponent_counts = (1, 2, 3, 4), simulations = 10000, seed = 1, path = PREFLOP_PATH):
+    """Writes preflop_equity.json: a list of {"hand", "opponents", "probability"} for all 1326 two-card hands.
+
+    Each hand is sorted by Card.to_id() (0 = 2c ... 51 = As), so ["Ah", "Ks"] is stored as ["Ks", "Ah"].
+    Preflop, suits only matter as suited vs offsuit, so the 1326 hands collapse into 169 classes (AKs, AKo, 77, ...).
+    We simulate each class once per opponent count and give every hand in that class the same probability,
+    which is ~8x faster than simulating all 1326 hands and just as accurate."""
+    all_cards = deck.get_deck()
+    hands = [sorted(pair, key=Card.to_id) for pair in combinations(all_cards, 2)]
+
+    def hand_class(h):
+        # (low rank, high rank, suited) -- id // 4 is the rank, id % 4 is the suit
+        a, b = Card.to_id(h[0]), Card.to_id(h[1])
+        return (a // 4, b // 4, a % 4 == b % 4)
+
+    representative = {} # first hand seen in each class, used for the simulation
+    for h in hands:
+        representative.setdefault(hand_class(h), h)
+
+    entries = []
+    for opponents in opponent_counts:
+        probability = {cls: equityV1(rep, [], opponents, simulations=simulations, seed=seed)["equity"]
+                       for cls, rep in representative.items()}
+        for h in hands:
+            entries.append({"hand": [str(c) for c in h], "opponents": opponents,
+                            "probability": round(probability[hand_class(h)], 4)})
+        print(f"done: {opponents} opponent(s)")
+
+    entries.sort(key=lambda e: (e["opponents"], [Card.to_id(c) for c in e["hand"]]))
+    with open(path, "w") as f:
+        json.dump(entries, f, indent=2)
+    return entries
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "preflop":
+    # Run: python models/equity/equity.py preflop   (takes several minutes)
+    build_preflop_table()
+    sys.exit()
+
 if __name__ == "__main__":
     # example call: AA vs 1 random opponent, preflop. Run: python models/equity/equity.py
-    hand = [Card("A", "h"), Card("A", "s")]
+    hand = [Card("Ah"), Card("As")]
     table = []
     players = 1
     seed = 1
