@@ -1,0 +1,702 @@
+"""
+Self-play REINFORCE for No-Limit Texas Hold'em (13-handed: 1 agent + 12 copies)
+==============================================================================
+
+Runs in Google Colab for hours:
+  * pure-Python NLHE engine (blinds, min-raise rules, short all-ins, side pots)
+  * one shared policy/value network plays every seat (self-play)
+  * a fraction of seats are played by frozen past snapshots (league) for stability
+  * REINFORCE with a learned value baseline + entropy bonus
+  * many tables stepped in parallel, one batched forward pass per step
+  * checkpoints to Google Drive every few minutes and auto-resumes after a disconnect
+  * periodic evaluation (bb/100) against random and calling-station bots
+
+Colab usage
+-----------
+  Cell 1:  from google.colab import drive; drive.mount('/content/drive')
+  Cell 2:  paste this file (or upload it and run:  !python poker_selfplay.py)
+
+Edit the CONFIG block below to change table size, stack depth, run length, etc.
+"""
+
+import os, time, math, random, csv, copy
+from dataclasses import dataclass, asdict
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ----------------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------------
+@dataclass
+class Config:
+    num_players: int = 13          # agent + twelve copies of itself
+    big_blind: int = 2             # chips; small blind = big_blind // 2
+    stack_bb: int = 100            # every seat starts each hand with 100 BB
+    num_tables: int = 128          # tables played in parallel
+    batch_decisions: int = 8192    # decisions collected per policy update
+    minibatch: int = 2048
+    lr: float = 1e-4
+    entropy_coef: float = 0.03
+    entropy_coef_final: float = 0.005
+    entropy_decay_updates: int = 20000
+    value_coef: float = 0.5
+    grad_clip: float = 1.0
+    return_scale: float = 20.0     # value head predicts (chips won in BB) / return_scale
+    hidden: int = 512
+    snapshot_every: int = 200      # updates between adding a frozen copy to the league
+    league_size: int = 20
+    league_seat_frac: float = 0.3  # fraction of seats played by past snapshots
+    eval_every: int = 250          # updates between evaluations
+    eval_hands: int = 5000
+    log_every: int = 25
+    checkpoint_minutes: float = 10.0
+    train_hours: float = 11.5      # stop after this long (Colab sessions cap around 12 h)
+    save_dir: str = "/content/drive/MyDrive/poker_rl"   # falls back to ./poker_rl if no Drive
+    seed: int = 0
+
+
+CFG = Config()
+
+NUM_ACTIONS = 6  # fold, check/call, raise 0.5 pot, raise 1 pot, raise 2 pot, all-in
+RAISE_FRACS = {2: 0.5, 3: 1.0, 4: 2.0}
+ACTION_NAMES = ["fold", "call", "r0.5p", "r1p", "r2p", "allin"]
+
+
+# ----------------------------------------------------------------------------
+# 7-card hand evaluator (cards are ints 0..51: rank = c // 4 (0=2 .. 12=A), suit = c % 4)
+# returns an int; higher is better
+# ----------------------------------------------------------------------------
+STRAIGHT_MASKS = [(0b11111 << (h - 4), h) for h in range(12, 3, -1)] + [(0b1000000001111, 3)]
+
+
+def _straight_high(mask):
+    for m, h in STRAIGHT_MASKS:
+        if mask & m == m:
+            return h
+    return -1
+
+
+def _score(cat, ranks):
+    s = cat
+    for i in range(5):
+        s = s * 16 + (ranks[i] if i < len(ranks) else 0)
+    return s
+
+
+def eval_hand(cards):
+    counts = [0] * 13
+    suit_masks = [0, 0, 0, 0]
+    suit_counts = [0, 0, 0, 0]
+    rmask = 0
+    for c in cards:
+        r, s = c >> 2, c & 3
+        counts[r] += 1
+        suit_masks[s] |= 1 << r
+        suit_counts[s] += 1
+        rmask |= 1 << r
+    # flush / straight flush
+    for s in range(4):
+        if suit_counts[s] >= 5:
+            sm = suit_masks[s]
+            h = _straight_high(sm)
+            if h >= 0:
+                return _score(8, [h])
+            fr = [r for r in range(12, -1, -1) if sm >> r & 1][:5]
+            flush_score = _score(5, fr)
+            break
+    else:
+        flush_score = None
+    quads, trips, pairs, singles = [], [], [], []
+    for r in range(12, -1, -1):
+        c = counts[r]
+        if c == 4: quads.append(r)
+        elif c == 3: trips.append(r)
+        elif c == 2: pairs.append(r)
+        elif c == 1: singles.append(r)
+    if quads:
+        kick = max([r for r in range(13) if counts[r] and r != quads[0]], default=0)
+        return _score(7, [quads[0], kick])
+    if trips and (len(trips) > 1 or pairs):
+        pair = max(trips[1:] + pairs)
+        return _score(6, [trips[0], pair])
+    if flush_score is not None:
+        return flush_score
+    h = _straight_high(rmask)
+    if h >= 0:
+        return _score(4, [h])
+    if trips:
+        return _score(3, [trips[0]] + singles[:2])
+    if len(pairs) >= 2:
+        kick = max(pairs[2:] + singles[:1], default=0)
+        return _score(2, [pairs[0], pairs[1], kick])
+    if pairs:
+        return _score(1, [pairs[0]] + singles[:3])
+    return _score(0, singles[:5])
+
+
+def hand_category(cards):
+    return eval_hand(cards) >> 20  # 0 high card .. 8 straight flush
+
+
+# ----------------------------------------------------------------------------
+# No-limit hold'em table
+# ----------------------------------------------------------------------------
+class Table:
+    def __init__(self, n, bb, stack_bb, rng):
+        self.n, self.bb, self.sb = n, bb, bb // 2
+        self.start_stack = bb * stack_bb
+        self.rng = rng
+        self.button = rng.integers(n)
+        self.done = True
+
+    # --- hand setup -------------------------------------------------------
+    def new_hand(self):
+        n = self.n
+        self.button = (self.button + 1) % n
+        self.deck = self.rng.permutation(52).tolist()
+        self.hole = [[self.deck.pop(), self.deck.pop()] for _ in range(n)]
+        self.board = []
+        self.stack = [self.start_stack] * n
+        self.bet = [0] * n            # chips put in this street
+        self.contrib = [0] * n        # chips put in this hand
+        self.folded = [False] * n
+        self.allin = [False] * n
+        self.acted = [False] * n
+        self.can_raise = [True] * n
+        self.street = 0
+        self.raises_per_street = [0, 0, 0, 0]
+        self.done = False
+        self.result = None
+        sb_seat = (self.button + 1) % n
+        bb_seat = (self.button + 2) % n
+        self._post(sb_seat, self.sb)
+        self._post(bb_seat, self.bb)
+        self.highest = self.bb
+        self.last_raise = self.bb
+        self.cur = (bb_seat + 1) % n
+        self._advance_to_actor(start=self.cur)
+
+    def _post(self, i, amt):
+        amt = min(amt, self.stack[i])
+        self.stack[i] -= amt
+        self.bet[i] += amt
+        self.contrib[i] += amt
+        if self.stack[i] == 0:
+            self.allin[i] = True
+
+    @property
+    def pot(self):
+        return sum(self.contrib)
+
+    def _live(self):
+        return [i for i in range(self.n) if not self.folded[i]]
+
+    def _can_act(self, i):
+        return not self.folded[i] and not self.allin[i]
+
+    # --- action legality ----------------------------------------------------
+    def raise_to_amount(self, i, a):
+        call_amt = self.highest - self.bet[i]
+        max_to = self.bet[i] + self.stack[i]
+        if a == 5:
+            return max_to
+        pot_after_call = self.pot + call_amt
+        raise_by = max(RAISE_FRACS[a] * pot_after_call, self.last_raise)
+        return int(min(self.highest + raise_by, max_to))
+
+    def legal_mask(self, i):
+        m = np.zeros(NUM_ACTIONS, dtype=bool)
+        call_amt = self.highest - self.bet[i]
+        m[1] = True
+        if call_amt > 0:
+            m[0] = True
+        max_to = self.bet[i] + self.stack[i]
+        others_can_act = any(self._can_act(j) for j in range(self.n) if j != i)
+        if self.stack[i] > call_amt and self.can_raise[i] and others_can_act:
+            m[5] = True
+            for a in (2, 3, 4):
+                if self.raise_to_amount(i, a) < max_to:
+                    m[a] = True
+        return m
+
+    # --- stepping -----------------------------------------------------------
+    def step(self, a):
+        """Apply action a for the current player. Returns True if the hand ended."""
+        i = self.cur
+        call_amt = self.highest - self.bet[i]
+        if a == 0:
+            self.folded[i] = True
+        elif a == 1:
+            self._post(i, call_amt)
+        else:
+            to = self.raise_to_amount(i, a)
+            self._post(i, to - self.bet[i])
+            raise_size = self.bet[i] - self.highest
+            if raise_size > 0:
+                full = raise_size >= self.last_raise
+                if full:
+                    self.last_raise = raise_size
+                for j in range(self.n):
+                    if j != i and self._can_act(j):
+                        if not full and self.acted[j]:
+                            self.can_raise[j] = False   # short all-in does not reopen raising
+                        elif full:
+                            self.can_raise[j] = True
+                        self.acted[j] = False
+                self.highest = self.bet[i]
+                self.raises_per_street[self.street] += 1
+        self.acted[i] = True
+
+        live = self._live()
+        if len(live) == 1:
+            self._finish_uncontested(live[0])
+            return True
+        if self._round_complete():
+            return self._next_street()
+        self._advance_to_actor(start=(i + 1) % self.n)
+        return False
+
+    def _round_complete(self):
+        for j in range(self.n):
+            if self._can_act(j) and (not self.acted[j] or self.bet[j] != self.highest):
+                return False
+        return True
+
+    def _advance_to_actor(self, start):
+        for k in range(self.n):
+            j = (start + k) % self.n
+            if self._can_act(j) and (not self.acted[j] or self.bet[j] != self.highest):
+                self.cur = j
+                return
+        # nobody needs to act (e.g. everyone all-in after blinds)
+        if self._next_street():
+            return
+
+    def _next_street(self):
+        # move to next street, or run it out if fewer than two players can still bet
+        while True:
+            if self.street == 3:
+                self._showdown()
+                return True
+            self.street += 1
+            if self.street == 1:
+                self.board += [self.deck.pop() for _ in range(3)]
+            else:
+                self.board.append(self.deck.pop())
+            self.bet = [0] * self.n
+            self.highest = 0
+            self.last_raise = self.bb
+            self.acted = [False] * self.n
+            self.can_raise = [True] * self.n
+            actors = [j for j in range(self.n) if self._can_act(j)]
+            if len(actors) >= 2:
+                for k in range(1, self.n + 1):
+                    j = (self.button + k) % self.n
+                    if self._can_act(j):
+                        self.cur = j
+                        return False
+            # 0 or 1 players can act: keep dealing
+
+    def _finish_uncontested(self, w):
+        self.stack[w] += self.pot
+        self._end()
+
+    def _showdown(self):
+        live = self._live()
+        scores = {i: eval_hand(self.hole[i] + self.board) for i in live}
+        contribs = self.contrib
+        levels = sorted(set(c for c in contribs if c > 0))
+        prev = 0
+        order = [(self.button + k) % self.n for k in range(1, self.n + 1)]
+        for lvl in levels:
+            part = sum(min(c, lvl) - min(c, prev) for c in contribs)
+            elig = [i for i in live if contribs[i] >= lvl]
+            if not elig:  # only folded players reached this level: give to deepest live player(s)
+                top = max(contribs[i] for i in live)
+                elig = [i for i in live if contribs[i] == top]
+            best = max(scores[i] for i in elig)
+            winners = [i for i in order if i in elig and scores[i] == best]
+            share, rem = divmod(part, len(winners))
+            for w in winners:
+                self.stack[w] += share
+            self.stack[winners[0]] += rem
+            prev = lvl
+        self._end()
+
+    def _end(self):
+        self.done = True
+        self.result = [(s - self.start_stack) / self.bb for s in self.stack]  # in BB
+
+
+# ----------------------------------------------------------------------------
+# Observation encoding (from the acting player's point of view)
+# ----------------------------------------------------------------------------
+def obs_dim(n):
+    return 52 + 52 + 4 + 7 + n + 6 * (n - 1) + 2 + 5 + 9 + 4
+
+
+def encode(t: Table, i: int):
+    n, bb = t.n, t.bb
+    S = t.start_stack
+    v = np.zeros(obs_dim(n), dtype=np.float32)
+    o = 0
+    for c in t.hole[i]:
+        v[o + c] = 1
+    o += 52
+    for c in t.board:
+        v[o + c] = 1
+    o += 52
+    v[o + t.street] = 1
+    o += 4
+    pot = t.pot
+    call_amt = t.highest - t.bet[i]
+    v[o:o + 7] = [pot / S, call_amt / S, t.stack[i] / S, t.bet[i] / S, t.last_raise / S,
+                  call_amt / (pot + call_amt) if call_amt > 0 else 0.0,
+                  min(t.stack[i] / max(pot, 1), 10) / 10]
+    o += 7
+    v[o + (i - t.button) % n] = 1  # position relative to button
+    o += n
+    for k in range(1, n):
+        j = (i + k) % n
+        v[o:o + 6] = [0.0 if t.folded[j] else 1.0, float(t.allin[j]), t.stack[j] / S,
+                      t.bet[j] / S, t.contrib[j] / S, float(t.acted[j])]
+        o += 6
+    live = len(t._live())
+    to_act = sum(1 for j in range(n) if j != i and t._can_act(j) and not t.acted[j])
+    v[o:o + 2] = [live / n, to_act / n]
+    o += 2
+    r1, r2 = sorted([c >> 2 for c in t.hole[i]], reverse=True)
+    suited = (t.hole[i][0] & 3) == (t.hole[i][1] & 3)
+    v[o:o + 5] = [float(r1 == r2), float(suited), r1 / 12, r2 / 12, (r1 - r2) / 12]
+    o += 5
+    cat = hand_category(t.hole[i] + t.board) if t.board else (1 if r1 == r2 else 0)
+    v[o + cat] = 1
+    o += 9
+    v[o:o + 4] = [min(x, 4) / 4 for x in t.raises_per_street]
+    return v
+
+
+# ----------------------------------------------------------------------------
+# Network
+# ----------------------------------------------------------------------------
+class PolicyNet(nn.Module):
+    def __init__(self, in_dim, hidden):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.LayerNorm(hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.GELU(),
+            nn.Linear(hidden, hidden // 2), nn.LayerNorm(hidden // 2), nn.GELU(),
+        )
+        self.pi = nn.Linear(hidden // 2, NUM_ACTIONS)
+        self.v = nn.Linear(hidden // 2, 1)
+
+    def forward(self, x, mask):
+        h = self.body(x)
+        logits = self.pi(h).masked_fill(~mask, -1e9)
+        return logits, self.v(h).squeeze(-1)
+
+
+# ----------------------------------------------------------------------------
+# Baseline bots for evaluation
+# ----------------------------------------------------------------------------
+def random_bot(mask, rng):
+    return int(rng.choice(np.flatnonzero(mask)))
+
+
+def calling_station(mask, rng):
+    return 1
+
+
+# ----------------------------------------------------------------------------
+# Trainer
+# ----------------------------------------------------------------------------
+class Trainer:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        random.seed(cfg.seed); np.random.seed(cfg.seed); torch.manual_seed(cfg.seed)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.rng = np.random.default_rng(cfg.seed)
+        self.dim = obs_dim(cfg.num_players)
+        self.net = PolicyNet(self.dim, cfg.hidden).to(self.device)
+        self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr)
+        self.league = []          # list of CPU state_dicts of frozen past policies
+        self.league_nets = []     # matching nets on device
+        self.updates = 0
+        self.hands = 0
+        self.decisions = 0
+        self.elapsed = 0.0
+        self.save_dir = self._pick_save_dir()
+        self.ckpt_path = os.path.join(self.save_dir, "checkpoint.pt")
+        self.log_path = os.path.join(self.save_dir, "log.csv")
+        self._resume()
+        self.tables = [Table(cfg.num_players, cfg.big_blind, cfg.stack_bb, np.random.default_rng(cfg.seed + 1000 + k))
+                       for k in range(cfg.num_tables)]
+        self.seat_role = [[-1] * cfg.num_players for _ in self.tables]   # -1 = current policy, k = league[k]
+        self.traj = [[[] for _ in range(cfg.num_players)] for _ in self.tables]
+        self.buf_obs, self.buf_mask, self.buf_act, self.buf_ret = [], [], [], []
+        self.stats = {"act": np.zeros(NUM_ACTIONS), "vpip": 0, "pf_decisions": 0}
+        for k in range(len(self.tables)):
+            self._start_hand(k)
+
+    # --- persistence --------------------------------------------------------
+    def _pick_save_dir(self):
+        d = self.cfg.save_dir
+        if not os.path.isdir(os.path.dirname(d.rstrip("/")) or "/"):
+            d = "./poker_rl"
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def save(self):
+        state = {
+            "net": self.net.state_dict(), "opt": self.opt.state_dict(), "league": self.league,
+            "updates": self.updates, "hands": self.hands, "decisions": self.decisions,
+            "elapsed": self.elapsed, "cfg": asdict(self.cfg),
+        }
+        tmp = self.ckpt_path + ".tmp"
+        torch.save(state, tmp)
+        os.replace(tmp, self.ckpt_path)
+        torch.save(self.net.state_dict(), os.path.join(self.save_dir, "policy_latest.pt"))
+
+    def _resume(self):
+        if not os.path.exists(self.ckpt_path):
+            print(f"Starting fresh. Saving to {self.save_dir}")
+            return
+        s = torch.load(self.ckpt_path, map_location=self.device, weights_only=False)
+        self.net.load_state_dict(s["net"]); self.opt.load_state_dict(s["opt"])
+        self.league = s["league"]
+        for sd in self.league:
+            self._add_league_net(sd)
+        self.updates, self.hands = s["updates"], s["hands"]
+        self.decisions, self.elapsed = s["decisions"], s["elapsed"]
+        print(f"Resumed from {self.ckpt_path}: {self.updates} updates, {self.hands:,} hands, "
+              f"{self.elapsed / 3600:.2f} h trained")
+
+    def _add_league_net(self, sd):
+        net = PolicyNet(self.dim, self.cfg.hidden).to(self.device)
+        net.load_state_dict(sd); net.eval()
+        self.league_nets.append(net)
+
+    def add_snapshot(self):
+        sd = {k: v.detach().cpu().clone() for k, v in self.net.state_dict().items()}
+        self.league.append(sd)
+        self._add_league_net(sd)
+        if len(self.league) > self.cfg.league_size:
+            self.league.pop(0); self.league_nets.pop(0)
+
+    # --- self-play ------------------------------------------------------------
+    def _start_hand(self, k):
+        t = self.tables[k]
+        t.new_hand()
+        n = self.cfg.num_players
+        if self.league_nets:
+            snap = self.rng.integers(len(self.league_nets))
+            roles = [snap if self.rng.random() < self.cfg.league_seat_frac else -1 for _ in range(n)]
+            if all(r != -1 for r in roles):
+                roles[self.rng.integers(n)] = -1
+        else:
+            roles = [-1] * n
+        self.seat_role[k] = roles
+        self.traj[k] = [[] for _ in range(n)]
+        if t.done:  # hand can end during setup only in degenerate cases
+            self._finish_hand(k)
+
+    def _finish_hand(self, k):
+        t = self.tables[k]
+        for seat, steps in enumerate(self.traj[k]):
+            if self.seat_role[k][seat] != -1:
+                continue
+            R = t.result[seat]
+            for (o, m, a) in steps:
+                self.buf_obs.append(o); self.buf_mask.append(m); self.buf_act.append(a); self.buf_ret.append(R)
+        self.hands += 1
+        self._start_hand(k)
+
+    @torch.no_grad()
+    def _act(self, net, obs, masks, greedy=False):
+        x = torch.as_tensor(np.stack(obs), device=self.device)
+        m = torch.as_tensor(np.stack(masks), device=self.device)
+        logits, _ = net(x, m)
+        if greedy:
+            return logits.argmax(-1).cpu().numpy()
+        return torch.distributions.Categorical(logits=logits).sample().cpu().numpy()
+
+    def play_step(self):
+        groups = {}
+        for k, t in enumerate(self.tables):
+            i = t.cur
+            role = self.seat_role[k][i]
+            groups.setdefault(role, []).append((k, i, encode(t, i), t.legal_mask(i)))
+        for role, items in groups.items():
+            net = self.net if role == -1 else self.league_nets[role]
+            acts = self._act(net, [x[2] for x in items], [x[3] for x in items])
+            for (k, i, o, m), a in zip(items, acts):
+                a = int(a)
+                t = self.tables[k]
+                if role == -1:
+                    self.traj[k][i].append((o, m, a))
+                    self.decisions += 1
+                    self.stats["act"][a] += 1
+                    if t.street == 0:
+                        self.stats["pf_decisions"] += 1
+                        self.stats["vpip"] += int(a >= 1 and (a > 1 or t.highest > t.bet[i]))
+                if t.step(a):
+                    self._finish_hand(k)
+
+    # --- learning -------------------------------------------------------------
+    def entropy_coef(self):
+        c = self.cfg
+        f = min(1.0, self.updates / c.entropy_decay_updates)
+        return c.entropy_coef + f * (c.entropy_coef_final - c.entropy_coef)
+
+    def update(self):
+        c = self.cfg
+        obs = torch.as_tensor(np.stack(self.buf_obs), device=self.device)
+        mask = torch.as_tensor(np.stack(self.buf_mask), device=self.device)
+        act = torch.as_tensor(np.array(self.buf_act), device=self.device)
+        ret = torch.as_tensor(np.array(self.buf_ret, dtype=np.float32), device=self.device) / c.return_scale
+        self.buf_obs, self.buf_mask, self.buf_act, self.buf_ret = [], [], [], []
+        N = len(act)
+        with torch.no_grad():
+            _, v_old = self.net(obs, mask)
+            adv = ret - v_old
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        perm = torch.randperm(N, device=self.device)
+        ent_c = self.entropy_coef()
+        tot = {"pi": 0.0, "v": 0.0, "ent": 0.0}
+        nb = 0
+        for s in range(0, N, c.minibatch):
+            idx = perm[s:s + c.minibatch]
+            logits, v = self.net(obs[idx], mask[idx])
+            logp_all = F.log_softmax(logits, -1)
+            logp = logp_all.gather(1, act[idx, None]).squeeze(1)
+            probs = logp_all.exp()
+            ent = -(probs * logp_all.masked_fill(~mask[idx], 0)).sum(-1).mean()
+            pi_loss = -(logp * adv[idx]).mean()
+            v_loss = F.smooth_l1_loss(v, ret[idx])
+            loss = pi_loss + c.value_coef * v_loss - ent_c * ent
+            self.opt.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.net.parameters(), c.grad_clip)
+            self.opt.step()
+            tot["pi"] += pi_loss.item(); tot["v"] += v_loss.item(); tot["ent"] += ent.item(); nb += 1
+        self.updates += 1
+        return {k: v / nb for k, v in tot.items()}
+
+    # --- evaluation -------------------------------------------------------------
+    @torch.no_grad()
+    def evaluate(self, bot, hands):
+        """Current policy in one seat vs (n-1) bots. Returns bb/100 and its standard error."""
+        self.net.eval()
+        rng = np.random.default_rng(12345)
+        n = self.cfg.num_players
+        tables = [Table(n, self.cfg.big_blind, self.cfg.stack_bb, np.random.default_rng(777 + k)) for k in range(64)]
+        results = []
+        for t in tables:
+            t.new_hand()
+        while len(results) < hands:
+            hero_items = []
+            for k, t in enumerate(tables):
+                while not t.done and t.cur != 0:
+                    if t.step(bot(t.legal_mask(t.cur), rng)):
+                        break
+                if t.done:
+                    results.append(t.result[0]); t.new_hand()
+                    continue
+                hero_items.append((k, encode(t, 0), t.legal_mask(0)))
+            if hero_items:
+                acts = self._act(self.net, [x[1] for x in hero_items], [x[2] for x in hero_items])
+                for (k, _, _), a in zip(hero_items, acts):
+                    t = tables[k]
+                    if t.step(int(a)):
+                        results.append(t.result[0]); t.new_hand()
+        self.net.train()
+        r = np.array(results[:hands])
+        return 100 * r.mean(), 100 * r.std() / math.sqrt(len(r))
+
+    # --- main loop --------------------------------------------------------------
+    def log_row(self, row):
+        new = not os.path.exists(self.log_path)
+        with open(self.log_path, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if new:
+                w.writeheader()
+            w.writerow(row)
+
+    def train(self):
+        c = self.cfg
+        print(f"device={self.device}  players={c.num_players}  tables={c.num_tables}  obs_dim={self.dim}")
+        t_start = time.time()
+        elapsed0 = self.elapsed
+        last_ckpt = time.time()
+        last_log_t, last_log_h = time.time(), self.hands
+        try:
+            while self.elapsed < c.train_hours * 3600:
+                while len(self.buf_act) < c.batch_decisions:
+                    self.play_step()
+                losses = self.update()
+                self.elapsed = elapsed0 + (time.time() - t_start)
+
+                if self.updates % c.snapshot_every == 0:
+                    self.add_snapshot()
+
+                if self.updates % c.log_every == 0:
+                    now = time.time()
+                    hps = (self.hands - last_log_h) / (now - last_log_t)
+                    last_log_t, last_log_h = now, self.hands
+                    a = self.stats["act"] / max(1, self.stats["act"].sum())
+                    vpip = self.stats["vpip"] / max(1, self.stats["pf_decisions"])
+                    dist = " ".join(f"{n}:{p:.2f}" for n, p in zip(ACTION_NAMES, a))
+                    print(f"[{self.elapsed / 3600:5.2f}h] upd {self.updates:6d} | hands {self.hands:,} "
+                          f"({hps:.0f}/s) | ent {losses['ent']:.3f} vloss {losses['v']:.4f} | "
+                          f"pf-VPIP {vpip:.2f} | {dist}")
+                    self.log_row({"hours": round(self.elapsed / 3600, 3), "updates": self.updates,
+                                  "hands": self.hands, "entropy": losses["ent"], "v_loss": losses["v"],
+                                  "pi_loss": losses["pi"], "vpip": vpip,
+                                  **{f"p_{n}": p for n, p in zip(ACTION_NAMES, a)}})
+                    self.stats = {"act": np.zeros(NUM_ACTIONS), "vpip": 0, "pf_decisions": 0}
+
+                if self.updates % c.eval_every == 0:
+                    for name, bot in (("random", random_bot), ("caller", calling_station)):
+                        m, se = self.evaluate(bot, c.eval_hands)
+                        print(f"    eval vs {c.num_players - 1}x {name:7s}: {m:+8.1f} ± {se:.1f} bb/100")
+                        self.log_row({"hours": round(self.elapsed / 3600, 3), "updates": self.updates,
+                                      "hands": self.hands, f"eval_{name}_bb100": m, f"eval_{name}_se": se})
+
+                if time.time() - last_ckpt > c.checkpoint_minutes * 60:
+                    self.save(); last_ckpt = time.time()
+                    print(f"    checkpoint saved -> {self.ckpt_path}")
+        except KeyboardInterrupt:
+            print("Interrupted; saving checkpoint...")
+        self.save()
+        print(f"Done. {self.hands:,} hands, {self.updates} updates. Checkpoint: {self.ckpt_path}")
+
+
+# ----------------------------------------------------------------------------
+# Quick self-tests of the engine (run once at start-up; takes about a second)
+# ----------------------------------------------------------------------------
+def _self_test():
+    C = lambda s: "23456789TJQKA".index(s[0]) * 4 + "cdhs".index(s[1])
+    h = lambda *xs: eval_hand([C(x) for x in xs])
+    assert h("As", "Ks", "Qs", "Js", "Ts", "2d", "3c") > h("9s", "9d", "9h", "9c", "Ad", "2c", "3h")   # SF > quads
+    assert h("Ah", "2d", "3c", "4s", "5h", "Kd", "Kc") >> 20 == 4                                     # wheel straight
+    assert h("Kh", "Kd", "Kc", "2s", "2h", "2d", "As") >> 20 == 6                                     # two trips -> full house
+    assert h("Ah", "Ad", "Kc", "Ks", "Qh", "Qd", "2c") > h("Ah", "Ad", "Kc", "Ks", "Jh", "Jd", "2c")   # kicker from 3rd pair
+    rng = np.random.default_rng(0)
+    for n in (2, 6, 13):
+        t = Table(n, 2, 100, rng)
+        for _ in range(3000):
+            t.new_hand()
+            while not t.done:
+                t.step(int(rng.choice(np.flatnonzero(t.legal_mask(t.cur)))))
+            assert abs(sum(t.result)) < 1e-9, "chips not conserved"
+            assert all(s >= 0 for s in t.stack)
+    print("engine self-test passed")
+
+
+if __name__ == "__main__":
+    _self_test()
+    Trainer(CFG).train()
