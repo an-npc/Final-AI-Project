@@ -5,6 +5,7 @@ run from the project folder:
     python run_bot.py --id group-1 --name "Bot Group 1" --url ws://localhost:8000/ws
     python run_bot.py --bot all-in --id baseline-all-in --name "Baseline All-In"
     python run_bot.py --bot random --id baseline-random --name "Baseline Random"
+    python run_bot.py --bot mel_bot --id mel-bot --name "Mel Bot"
 """
 import argparse
 import asyncio
@@ -13,12 +14,15 @@ import json
 import websockets
 
 from models.bot.BaseBot import BaseBot
-from models.bot.RandomBot import AllInBot, RandomBot
+from models.bot.AllInBot import AllInBot
+from models.bot.MelBot import MelBot
+from models.bot.RandomBot import RandomBot
 
 BOTS = {
     "base": BaseBot,
     "all-in": AllInBot,
     "random": RandomBot,
+    "mel_bot": MelBot,
 }
 
 
