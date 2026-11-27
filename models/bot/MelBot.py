@@ -36,13 +36,13 @@ class MelBot(BaseBot):
         opponents = self.opponents_in_hand(state)
         equity = lookup_equity(self.hand, board, opponents)["equity"]
 
-        highest_bet = max(p["bet"] for p in state["players"])
+        highest_bet = self.table_bet(state)
         to_call = highest_bet - self.current_bet
         max_target = self.current_bet + self.chips  # all-in, as a total bet for the round
 
-        if equity >= self.raise_threshold(opponents) and max_target > highest_bet:
+        if equity >= self.raise_threshold(opponents) and self.can_raise(state):
             # raising by at least the current bet is always a legal size (the last raise can't be bigger than it)
-            size = max(state["big_blind"], highest_bet, int(0.75 * state["pot"]))
+            size = max(state["big_blind"], state.get("minimum_raise", 0), highest_bet, int(0.75 * state["pot"]))
             return "raise", min(highest_bet + size, max_target)
 
         if to_call == 0:

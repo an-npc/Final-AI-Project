@@ -10,11 +10,10 @@ class AllInBot(BaseBot):
     def choose_action(self, state) -> tuple[str, int]:
         """_note_
         returns a raise to the bot's maximum total bet for the round,
-        or a call when raising is not possible
+        or a call (check when free) when raising is not possible
         """
-        highest_bet = max(player["bet"] for player in state["players"])
-        all_in_target = self.current_bet + self.chips
-
-        if all_in_target > highest_bet:
-            return "raise", all_in_target
+        if self.can_raise(state):
+            return "raise", self.current_bet + self.chips
+        if self.table_bet(state) == self.current_bet:
+            return "check", 0
         return "call", 0

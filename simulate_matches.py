@@ -40,23 +40,25 @@ def play_hand(engine, bots):
     """
     for player in engine.players.values():
         player.stack = STACK
+    engine._bankroll_finished = False  # stacks were just refilled, so a bust-out doesn't end the run
     engine.start_hand()
     rejected = 0
     while engine.phase not in ("WAITING", "SHOWDOWN") and engine.current_turn:
         pid = engine.current_turn
         state = engine.snapshot(pid)
-        bots[pid].update_from_state(state, pid)
-        action, amount = bots[pid].choose_action(state)
-        if not engine.place_action(pid, action, amount)["ok"]:
+        action, amount = bots[pid].act(state, pid)
+        if not engine.place_action(pid, action, amount if action in ("raise", "bet") else 0)["ok"]:
             rejected += 1
-            engine.place_action(pid, "call", 0)  # same fallback as run_bot.py
+            # same fallback as run_bot.py
+            engine.place_action(pid, "check" if engine.players[pid].bet == engine.current_bet else "call", 0)
     if engine.phase == "SHOWDOWN":
         engine.finalize_showdown()
     return rejected
 
 
 def run_table(opponent_classes, hands):
-    engine = PokerEngine(starting_stack=STACK, small_blind=10, big_blind=20)
+    # the server stops a match after max_hands (config.toml, 100 by default); every hand here is independent
+    engine = PokerEngine(starting_stack=STACK, small_blind=10, big_blind=20, max_hands=hands)
     bots = {"mel": MelBot()}
     engine.add_player("mel", "Mel Bot")
     for i, cls in enumerate(opponent_classes):
