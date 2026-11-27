@@ -26,14 +26,26 @@ BOTS = {
 }
 
 
+def turn_key(state):
+    """_note_
+    identifies one decision point. the server re-sends the same snapshot (e.g. after a rejected
+    action or someone joining), and those repeats must not be answered twice
+    """
+    return (state["hand_number"], state["phase"], state.get("current_bet"),
+            tuple((p["id"], p["bet"], p["folded"], p["all_in"]) for p in state["players"]))
+
+
 async def play(bot, my_id, name, url):
     """_note_
     joins the table, then answers every state snapshot where it is this bots turn
+    the server folds (or checks) for us if we take longer than turn_timeout_seconds (config.toml)
     """
     async with websockets.connect(url) as websocket:
         await websocket.send(json.dumps({"type": "join", "name": name, "player_id": my_id}))
         print(f"{name} connected to {url}")
-        last_sent = None
+        pending = False      # an action is in flight, wait for its action_result
+        last_turn = None     # turn_key of the last snapshot we answered
+        fallback = None      # safe action for the current turn if ours is rejected
 
         while True:
             message = json.loads(await websocket.recv())
@@ -41,26 +53,37 @@ async def play(bot, my_id, name, url):
 
             if msg_type == "state":
                 state = message["payload"]
-                if state["current_turn"] != my_id:
+                if state["hand_number"] == 0:
+                    pending, last_turn = False, None  # match restarted
+                if pending or state["current_turn"] != my_id:
                     continue  # server sends a snapshot after every change, most are not our turn
+                key = turn_key(state)
+                if key == last_turn:
+                    continue  # repeat of a turn we already answered
 
-                bot.update_from_state(state, my_id)
-                action, amount = bot.choose_action(state)
-                last_sent = action
-                await websocket.send(json.dumps({"type": "action", "action": action, "amount": amount}))
+                action, amount = bot.act(state, my_id)
+                me = next(p for p in state["players"] if p["id"] == my_id)
+                fallback = "check" if me["bet"] == state.get("current_bet", me["bet"]) else "call"
+                msg = {"type": "action", "action": action}
+                if action in ("raise", "bet"):
+                    msg["amount"] = amount  # the server rejects an amount on fold/check/call
+                await websocket.send(json.dumps(msg))
+                pending, last_turn = True, key
                 print(f"[hand {state['hand_number']} {state['phase']}] hand={bot.get_hand()} chips={bot.get_chips()} -> {action} {amount or ''}")
 
             elif msg_type == "action_result":
                 result = message["payload"]
+                pending = False
                 if not result["ok"]:
                     print("Rejected:", result["error"])
-                    # still our turn after a rejected action, call is always legal so fall back to it once
-                    if last_sent != "call":
-                        last_sent = "call"
-                        await websocket.send(json.dumps({"type": "action", "action": "call"}))
+                    # still our turn after a rejected action, fall back once to check/call which is always legal
+                    if fallback is not None:
+                        await websocket.send(json.dumps({"type": "action", "action": fallback}))
+                        pending, fallback = True, None
 
             elif msg_type == "error":
                 print("Server error:", message["message"])
+                pending = False
 
 
 def main():

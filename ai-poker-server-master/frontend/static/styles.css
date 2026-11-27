@@ -200,7 +200,7 @@ button:disabled {
   }
 
   .chip-stacks-panel {
-    width: 320px;
+    width: 360px;
     flex-shrink: 0;
   }
 
@@ -245,6 +245,7 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  text-align: left;
   font-size: 0.85rem;
   font-weight: 700;
 }
@@ -252,7 +253,7 @@ button:disabled {
 .stack-value {
   flex-shrink: 0;
   color: var(--text-soft);
-  font-size: 1.3rem;
+  font-size: 1.1rem;
   font-weight: 700;
   text-align: right;
 }
@@ -310,7 +311,7 @@ button:disabled {
 
 .community-cards {
   position: absolute;
-  top: 52%;
+  top: 280px;
   left: 50%;
   transform: translate(-50%, -50%);
   display: flex;
@@ -357,12 +358,11 @@ button:disabled {
 }
 
 .players-grid {
-  position: absolute;
-  inset: 0;
+  position: relative;
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
   gap: 10px;
-  padding: 18px;
+  padding: 420px 18px 18px;
   align-items: end;
 }
 
@@ -372,7 +372,8 @@ button:disabled {
   border-radius: 16px;
   padding: 10px 12px;
   width: 100%;
-  height: 296px;
+  min-height: 296px;
+  height: auto;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -397,19 +398,22 @@ button:disabled {
 
 .player-name {
   display: flex;
+  min-width: 0;
   align-items: center;
   font-weight: 700;
   margin-bottom: 6px;
 }
 
 .player-name-text {
+  flex: 0 1 auto;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
   min-width: 0;
 }
 
-.dealer-chip {
+.dealer-chip,
+.blind-chip {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -424,6 +428,22 @@ button:disabled {
   vertical-align: middle;
 }
 
+.blind-chip {
+  width: 24px;
+  border-radius: 6px;
+}
+
+.small-blind-chip {
+  background: #b9ddff;
+  color: #102d4a;
+}
+
+.big-blind-chip {
+  background: #b5eed1;
+  color: #123d2a;
+}
+
+.player-hands,
 .player-stack,
 .player-bet {
   color: var(--text-soft);
@@ -435,7 +455,10 @@ button:disabled {
 
 .player-stack {
   margin-top: 10px;
+  white-space: normal;
 }
+
+.play-button:disabled { cursor: default; opacity: 0.65; }
 
 .player-state {
   color: var(--warning);

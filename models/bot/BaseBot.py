@@ -136,13 +136,53 @@ class BaseBot():
         self.current_bet = me["bet"]
         self.is_out = me["folded"]
 
+    def table_bet(self, state):
+        """_note_
+        the bet everyone has to match this round. the server sends it as current_bet;
+        it can be higher than any posted bet when the big blind is short-stacked
+        """
+        if "current_bet" in state:
+            return state["current_bet"]
+        return max(p["bet"] for p in state["players"])
+
+    def can_raise(self, state):
+        """_note_
+        True when the server would accept a raise from this bot right now:
+          - the bot has chips beyond the current bet
+          - at least one other player can still act (the server refuses raising into only all-in players)
+          - a short all-in since the bot last acted this round did not leave raising closed
+        """
+        table_bet = self.table_bet(state)
+        if self.current_bet + self.chips <= table_bet:
+            return False
+        my_id = getattr(self, "id", None)
+        if not any(p["id"] != my_id and p["hole_cards"] and not p["folded"] and not p.get("all_in", False)
+                   and p.get("connected", True) for p in state["players"]):
+            return False
+        last = getattr(self, "_last_turn", None)
+        faced = last[2] if last and last[:2] == (state.get("hand_number"), state.get("phase")) else None
+        min_raise = state.get("minimum_raise", state.get("big_blind", 0))
+        if faced is not None and faced > 0 and table_bet - faced < min_raise:
+            return False
+        return True
+
+    def act(self, state, my_id) -> tuple[str, int]:
+        """_note_
+        one full turn: sync with the server state, pick an action, and remember the bet the bot left
+        on the table, which can_raise() needs for the short all-in rule
+        """
+        self.update_from_state(state, my_id)
+        action, amount = self.choose_action(state)
+        faced = amount if action in ("raise", "bet") else self.table_bet(state)
+        self._last_turn = (state.get("hand_number"), state.get("phase"), faced)
+        return action, amount
+
     def choose_action(self, state) -> tuple[str, int]:
         """_note_
         decides what to do on this bot's turn, returns action and amount
         for "raise", amount is the bots total bet for the round, not the extra chips
         child bots override this with their own strategy, default is check or call
         """
-        table_bet = max(p["bet"] for p in state["players"])
-        if table_bet == self.current_bet:
+        if self.table_bet(state) == self.current_bet:
             return "check", 0
         return "call", 0
